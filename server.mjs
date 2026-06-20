@@ -221,7 +221,22 @@ app.get("/api/deploy/:id/logs", requireApiKey, async (req, res) => {
 });
 
 /* ── 5. STOP / DELETE DEPLOYMENT ── */
-app.delete("/api/deploy/:id", requireApiKey, async (req, res) => {
+app.delete("/api/deploy/:id", async (req, res) => {
+  // Auth: accept either x-api-key header OR userId in body (for building/failed deploys that have no key yet)
+  let userId = null;
+
+  const apiKey = req.headers["x-api-key"];
+  if (apiKey) {
+    const { data: keyData } = await supabase
+      .from("api_keys").select("user_id, is_active").eq("api_key", apiKey).single();
+    if (keyData && keyData.is_active) userId = keyData.user_id;
+  }
+
+  // Fallback: userId from request body
+  if (!userId && req.body?.userId) userId = req.body.userId;
+
+  if (!userId) return res.status(401).json({ error: "Unauthorized." });
+
   const { data } = await supabase
     .from("deployments")
     .select("container_id, user_id, container_port")
@@ -229,12 +244,12 @@ app.delete("/api/deploy/:id", requireApiKey, async (req, res) => {
     .single();
 
   if (!data) return res.status(404).json({ error: "Not found." });
-  if (data.user_id !== req.userId) return res.status(403).json({ error: "Forbidden." });
+  if (data.user_id !== userId) return res.status(403).json({ error: "Forbidden." });
 
-  if (data.container_id) await removeContainer(data.container_id);
-  if (data.container_port) portMap.delete(req.userId);
+  if (data.container_id) await removeContainer(data.container_id).catch(()=>{});
+  if (data.container_port) portMap.delete(userId);
 
-  await supabase.from("deployments").update({ status: "stopped" }).eq("id", req.params.id);
+  await supabase.from("deployments").delete().eq("id", req.params.id);
   res.json({ success: true });
 });
 
