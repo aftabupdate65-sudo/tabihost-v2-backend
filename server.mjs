@@ -83,13 +83,15 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
 
     // Generate API key
     const apiKeyVal = "tabi_" + uuid().replace(/-/g, "");
-    const { data: keyData } = await supabase
+    const { data: keyData, error: keyErr } = await supabase
       .from("api_keys")
       .insert({ user_id: userId, api_key: apiKeyVal, label: label || "My API" })
       .select().single();
 
+    if (keyErr || !keyData) throw new Error("API key insert failed: " + (keyErr?.message || "unknown"));
+
     // Save deployment + code files in Supabase
-    const { data: deploy } = await supabase
+    const { data: deploy, error: depErr } = await supabase
       .from("deployments")
       .insert({
         user_id: userId,
@@ -97,10 +99,12 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
         label: label || "My API",
         language,
         entry_file,
-        code_files: JSON.stringify(files), // store code directly in Supabase
+        code_files: JSON.stringify(files),
         status: "active",
       })
       .select().single();
+
+    if (depErr || !deploy) throw new Error("Deployment insert failed: " + (depErr?.message || "unknown"));
 
     res.json({
       success: true,
@@ -131,12 +135,14 @@ app.post("/api/deploy/code", limiter, async (req, res) => {
 
   try {
     const apiKeyVal = "tabi_" + uuid().replace(/-/g, "");
-    const { data: keyData } = await supabase
+    const { data: keyData, error: keyErr } = await supabase
       .from("api_keys")
       .insert({ user_id: userId, api_key: apiKeyVal, label: label || "My API" })
       .select().single();
 
-    const { data: deploy } = await supabase
+    if (keyErr || !keyData) throw new Error("API key insert failed: " + (keyErr?.message || "unknown"));
+
+    const { data: deploy, error: depErr } = await supabase
       .from("deployments")
       .insert({
         user_id: userId,
@@ -148,6 +154,8 @@ app.post("/api/deploy/code", limiter, async (req, res) => {
         status: "active",
       })
       .select().single();
+
+    if (depErr || !deploy) throw new Error("Deployment insert failed: " + (depErr?.message || "unknown"));
 
     res.json({
       success: true,
