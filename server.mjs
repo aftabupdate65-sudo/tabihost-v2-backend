@@ -1,4 +1,4 @@
-// server.mjs
+// server.mjs — Tabi Host v3 (Supabase storage, Piston execution)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -11,10 +11,6 @@ import { v4 as uuid } from "uuid";
 
 import { supabase } from "./supabase.mjs";
 import { runCode, SUPPORTED_LANGUAGES } from "./piston.mjs";
-import {
-  createFolder, uploadFile, uploadContent,
-  fetchFileContent, listFolder, deleteFile
-} from "./gdrive.mjs";
 
 dotenv.config();
 
@@ -31,14 +27,13 @@ const runLimiter = rateLimit({ windowMs: 60_000, max: 20 });
 
 const upload = multer({
   dest: UPLOAD_TMP,
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_, f, cb) => {
     if (f.originalname.endsWith(".zip")) return cb(null, true);
     cb(new Error("Only .zip files allowed"));
   },
 });
 
-/* ── Helper: validate API key ── */
 async function validateKey(apiKey) {
   if (!apiKey) return null;
   const { data } = await supabase
@@ -50,18 +45,14 @@ async function validateKey(apiKey) {
   return data;
 }
 
-/* ══════════════════════════════════════
-   HEALTH
-   ══════════════════════════════════════ */
+/* ── Health ── */
 app.get("/", (_, res) => res.json({
   status: "ok",
-  service: "Tabi Host v3 — Piston powered",
+  service: "Tabi Host v3",
   languages: Object.keys(SUPPORTED_LANGUAGES),
 }));
 
-app.get("/api/languages", (_, res) => {
-  res.json({ languages: SUPPORTED_LANGUAGES });
-});
+app.get("/api/languages", (_, res) => res.json({ languages: SUPPORTED_LANGUAGES }));
 
 /* ══════════════════════════════════════
    DEPLOY — ZIP upload
@@ -75,43 +66,29 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
   if (!SUPPORTED_LANGUAGES[language]) return res.status(400).json({ error: `Language "${language}" not supported.` });
 
   try {
-    // 1. Unzip
+    // Unzip and read files
     const zip = new AdmZip(req.file.path);
     const entries = zip.getEntries().filter(e => !e.isDirectory);
+    if (!entries.length) throw new Error("ZIP is empty.");
 
-    if (entries.length === 0) throw new Error("ZIP is empty.");
+    // Convert files to [{name, content}] array
+    const files = entries.map(e => ({
+      name: e.entryName,
+      content: e.getData().toString("utf8"),
+    }));
 
-    // 2. Create Drive folder
-    const folderName = `tabihost_${userId}_${Date.now()}`;
-    const folderId = await createFolder(
-      folderName,
-      process.env.GDRIVE_PARENT_FOLDER_ID || null
-    );
-
-    // 3. Upload each file to Drive
-    const tmpDir = path.join(UPLOAD_TMP, uuid());
-    fs.mkdirSync(tmpDir, { recursive: true });
-
-    for (const entry of entries) {
-      const filePath = path.join(tmpDir, entry.entryName);
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, entry.getData());
-      await uploadFile(filePath, entry.entryName, folderId);
-    }
-
-    // Cleanup tmp
-    fs.rmSync(tmpDir, { recursive: true, force: true });
     fs.unlinkSync(req.file.path);
 
-    // 4. Generate API key
+    const entry_file = entryFile || entries[0].entryName;
+
+    // Generate API key
     const apiKeyVal = "tabi_" + uuid().replace(/-/g, "");
     const { data: keyData } = await supabase
       .from("api_keys")
       .insert({ user_id: userId, api_key: apiKeyVal, label: label || "My API" })
       .select().single();
 
-    // 5. Save deployment metadata to Supabase
-    const entry_file = entryFile || entries[0].entryName;
+    // Save deployment + code files in Supabase
     const { data: deploy } = await supabase
       .from("deployments")
       .insert({
@@ -120,7 +97,7 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
         label: label || "My API",
         language,
         entry_file,
-        drive_folder_id: folderId,
+        code_files: JSON.stringify(files), // store code directly in Supabase
         status: "active",
       })
       .select().single();
@@ -132,7 +109,7 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
       endpoint: `${process.env.PUBLIC_URL}/run/${deploy.id}`,
       language,
       entryFile: entry_file,
-      files: entries.map(e => e.entryName),
+      files: files.map(f => f.name),
     });
 
   } catch (err) {
@@ -142,37 +119,23 @@ app.post("/api/deploy/zip", limiter, upload.single("code"), async (req, res) => 
 });
 
 /* ══════════════════════════════════════
-   DEPLOY — Direct code editor
+   DEPLOY — Code editor
    ══════════════════════════════════════ */
 app.post("/api/deploy/code", limiter, async (req, res) => {
   const { userId, label, language, files } = req.body;
-  // files: [{ name: "main.py", content: "print('hello')" }, ...]
 
   if (!userId)   return res.status(400).json({ error: "userId required." });
   if (!language) return res.status(400).json({ error: "language required." });
-  if (!files || !files.length) return res.status(400).json({ error: "files required." });
+  if (!files?.length) return res.status(400).json({ error: "files required." });
   if (!SUPPORTED_LANGUAGES[language]) return res.status(400).json({ error: `Language "${language}" not supported.` });
 
   try {
-    // 1. Create Drive folder
-    const folderId = await createFolder(
-      `tabihost_${userId}_${Date.now()}`,
-      process.env.GDRIVE_PARENT_FOLDER_ID || null
-    );
-
-    // 2. Upload each file content to Drive
-    for (const file of files) {
-      await uploadContent(file.content, file.name, folderId);
-    }
-
-    // 3. Generate API key
     const apiKeyVal = "tabi_" + uuid().replace(/-/g, "");
     const { data: keyData } = await supabase
       .from("api_keys")
       .insert({ user_id: userId, api_key: apiKeyVal, label: label || "My API" })
       .select().single();
 
-    // 4. Save metadata
     const { data: deploy } = await supabase
       .from("deployments")
       .insert({
@@ -181,7 +144,7 @@ app.post("/api/deploy/code", limiter, async (req, res) => {
         label: label || "My API",
         language,
         entry_file: files[0].name,
-        drive_folder_id: folderId,
+        code_files: JSON.stringify(files),
         status: "active",
       })
       .select().single();
@@ -202,10 +165,7 @@ app.post("/api/deploy/code", limiter, async (req, res) => {
 });
 
 /* ══════════════════════════════════════
-   RUN — Execute user's deployed code
-   POST /run/:deploymentId
-   Header: x-api-key
-   Body: { "stdin": "optional input" }
+   RUN — Execute deployed code
    ══════════════════════════════════════ */
 app.post("/run/:deploymentId", runLimiter, async (req, res) => {
   const apiKey = req.headers["x-api-key"];
@@ -219,7 +179,7 @@ app.post("/run/:deploymentId", runLimiter, async (req, res) => {
     .single();
 
   if (!deploy) return res.status(404).json({ error: "Deployment not found." });
-  if (deploy.status !== "active") return res.status(400).json({ error: "Deployment is not active." });
+  if (deploy.status !== "active") return res.status(400).json({ error: "Deployment not active." });
   if (deploy.user_id !== keyData.user_id) return res.status(403).json({ error: "Forbidden." });
 
   const stdin = req.body?.stdin || req.body?.input || "";
@@ -227,37 +187,15 @@ app.post("/run/:deploymentId", runLimiter, async (req, res) => {
   try {
     const start = Date.now();
 
-    // 1. Fetch code files from Drive
-    let files = [];
+    // Get code files from Supabase
+    const files = JSON.parse(deploy.code_files || "[]");
+    if (!files.length) throw new Error("No code files found.");
 
-    if (deploy.drive_folder_id) {
-      // Multi-file: fetch all files from folder
-      const driveFiles = await listFolder(deploy.drive_folder_id);
-      files = await Promise.all(
-        driveFiles.map(async f => ({
-          name: f.name,
-          content: await fetchFileContent(f.id),
-        }))
-      );
-    } else if (deploy.drive_file_id) {
-      // Single file
-      const content = await fetchFileContent(deploy.drive_file_id);
-      files = [{ name: deploy.entry_file, content }];
-    }
-
-    if (!files.length) throw new Error("No code files found in storage.");
-
-    // 2. Run via Piston
-    const result = await runCode(
-      deploy.language,
-      files,
-      String(stdin),
-      deploy.entry_file
-    );
-
+    // Run via Piston
+    const result = await runCode(deploy.language, files, String(stdin), deploy.entry_file);
     const duration = Date.now() - start;
 
-    // 3. Log to Supabase (best effort)
+    // Log (best effort)
     await supabase.from("request_logs").insert({
       deployment_id: deploy.id,
       user_id: keyData.user_id,
@@ -288,7 +226,7 @@ app.post("/run/:deploymentId", runLimiter, async (req, res) => {
 app.get("/api/deployments/:userId", limiter, async (req, res) => {
   const { data, error } = await supabase
     .from("deployments")
-    .select("*, api_keys(api_key)")
+    .select("id, label, language, entry_file, status, created_at, api_keys(api_key)")
     .eq("user_id", req.params.userId)
     .eq("status", "active")
     .order("created_at", { ascending: false });
@@ -299,9 +237,7 @@ app.get("/api/deployments/:userId", limiter, async (req, res) => {
   res.json({
     success: true,
     deployments: (data || []).map(d => ({
-      id: d.id,
-      label: d.label,
-      language: d.language,
+      id: d.id, label: d.label, language: d.language,
       entryFile: d.entry_file,
       apiKey: d.api_keys?.api_key || null,
       endpoint: `${base}/run/${d.id}`,
@@ -319,25 +255,19 @@ app.delete("/api/deploy/:id", limiter, async (req, res) => {
 
   const { data } = await supabase
     .from("deployments")
-    .select("user_id, drive_folder_id, drive_file_id")
+    .select("user_id")
     .eq("id", req.params.id)
     .single();
 
   if (!data) return res.status(404).json({ error: "Not found." });
   if (data.user_id !== userId) return res.status(403).json({ error: "Forbidden." });
 
-  // Delete from Drive
-  if (data.drive_folder_id) await deleteFile(data.drive_folder_id);
-  if (data.drive_file_id)   await deleteFile(data.drive_file_id);
-
-  // Soft delete in Supabase
   await supabase.from("deployments").update({ status: "deleted" }).eq("id", req.params.id);
-
   res.json({ success: true });
 });
 
 /* ══════════════════════════════════════
-   REQUEST LOGS
+   LOGS
    ══════════════════════════════════════ */
 app.get("/api/logs/:deploymentId", limiter, async (req, res) => {
   const { data } = await supabase
@@ -346,9 +276,7 @@ app.get("/api/logs/:deploymentId", limiter, async (req, res) => {
     .eq("deployment_id", req.params.deploymentId)
     .order("created_at", { ascending: false })
     .limit(50);
-
   res.json({ success: true, logs: data || [] });
 });
 
-/* ── START ── */
 app.listen(PORT, () => console.log(`Tabi Host v3 running on port ${PORT}`));
