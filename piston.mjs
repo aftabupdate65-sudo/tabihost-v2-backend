@@ -1,7 +1,7 @@
 // piston.mjs — Piston API se user code run karta hai
 // Piston: https://github.com/engineer-man/piston (free, no auth needed)
 
-const PISTON_URL = "https://emkc.org/api/v2/piston";
+const PISTON_URL = process.env.PISTON_URL || "https://emkc.org/api/v2/piston";
 
 // Supported languages with their Piston runtime names
 export const SUPPORTED_LANGUAGES = {
